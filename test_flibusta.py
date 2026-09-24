@@ -1,400 +1,280 @@
 import io
-import json
 from contextlib import redirect_stdout, redirect_stderr
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from urllib.error import HTTPError
 import zipfile
 
-import flibusta
+from fli_app import catalog, cli, files
+from fli_app.journal import Journal, LOG_NAME
+from fli_app.transport import Transport
 
 
-FEED_0 = b'''<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry><id>/b/10</id><title>Russian Book</title>
-    <content type="html">&#x3C;br/&#x3E;\xd0\xa4\xd0\xbe\xd1\x80\xd0\xbc\xd0\xb0\xd1\x82: fb2&#x3C;br/&#x3E;\xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba: ru</content>
-    <link rel="http://opds-spec.org/acquisition" href="/b/10/fb2" type="application/fb2+zip"/>
-    <link rel="http://opds-spec.org/acquisition" href="/b/10/pdf" type="application/pdf"/>
-  </entry>
-  <link rel="next" href="/opds/author/1/alphabet/1"/>
-</feed>'''
-FEED_1 = b'''<feed xmlns="http://www.w3.org/2005/Atom">
-  <entry><id>/b/11</id><title>English Book</title>
-    <content type="html">\xd0\xa4\xd0\xbe\xd1\x80\xd0\xbc\xd0\xb0\xd1\x82: pdf&amp;lt;br/&amp;gt;\xd0\xaf\xd0\xb7\xd1\x8b\xd0\xba: en</content>
-    <link rel="http://opds-spec.org/acquisition" href="/b/11/download" type="application/pdf+rar"/>
-  </entry>
-</feed>'''
+FEED = '''<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>/b/10</id><title>Russian Book</title><content>Язык: ru</content>
+    <link href="/b/10/fb2" type="application/fb2+zip" />
+    <link href="/b/10/pdf" type="application/pdf" /></entry>
+  <entry><id>/b/11</id><title>English Book</title><content>Язык: en</content>
+    <link href="/b/11/pdf" type="application/pdf" /></entry>
+</feed>'''.encode()
+SEARCH = '''<h3>Найденные писатели (1 - 1 из 1):</h3><ul>
+  <li><a href="/a/20391">Джон Соул</a> (через синоним
+  <a href="/a/38360"><span>John</span> <span>Saul</span></a>)</li>
+</ul>'''.encode()
 
 
-def archive():
-    data = io.BytesIO()
-    with zipfile.ZipFile(data, "w") as output:
-        output.writestr("book.fb2", "book text")
-    return data.getvalue()
+def fb2_zip(content=b'<FictionBook><body/></FictionBook>'):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as archive:
+        archive.writestr('book.fb2', content)
+    return output.getvalue()
+
+
+class FixtureHandler(BaseHTTPRequestHandler):
+    responses = {}
+    calls = []
+    lock = threading.Lock()
+
+    def do_GET(self):
+        with self.lock:
+            self.calls.append(self.path)
+            item = self.responses.get(self.path, (404, b'missing', 'text/plain'))
+            if isinstance(item, list):
+                status, body, content_type = item.pop(0) if len(item) > 1 else item[0]
+            else:
+                status, body, content_type = item
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
 
 
 class DownloaderTests(unittest.TestCase):
-    def test_feed_pagination_and_formats(self):
-        books, next_url = flibusta.parse_feed(FEED_0)
-        self.assertEqual((books[0].language, books[0].original_format), ("ru", "fb2"))
-        self.assertEqual(next_url, "/opds/author/1/alphabet/1")
-        english, _ = flibusta.parse_feed(FEED_1)
-        self.assertEqual((english[0].language, english[0].original_format), ("en", "pdf"))
-
-    def test_cli_saves_zip_by_default_and_extracts_with_x(self):
-        pages = {"/opds/author/1/alphabet/0": FEED_0,
-                 "/opds/author/1/alphabet/1": FEED_1,
-                 "/b/10/fb2": archive(), "/b/10/pdf": b"%PDF-1.4", "/b/11/download": b"Rar!\x1a\x07payload"}
-        calls = []
-
-        def fake_get(url):
-            path = url.removeprefix("https://mirror.test")
-            calls.append(path)
-            return pages[path], {}, url
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            config = Path(folder) / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            self.assertEqual(flibusta.main(["1", "--config", str(config)]), 0)
-            self.assertEqual((Path(folder) / "Russian Book [10].fb2.zip").read_bytes(), pages["/b/10/fb2"])
-            self.assertNotIn("/b/10/pdf", calls)
-            self.assertEqual(flibusta.main(["1", "--config", str(config), "-l", "en", "-f", "pdf"]), 0)
-            self.assertEqual((Path(folder) / "English Book [11].pdf.rar").read_bytes(), pages["/b/11/download"])
-            self.assertEqual(flibusta.main(["1", "--config", str(config), "-x"]), 0)
-            self.assertEqual((Path(folder) / "Russian Book [10].fb2").read_text(), "book text")
-
-    def test_author_url(self):
-        self.assertEqual(flibusta.author_id_and_base("http://flibusta.is/a/2583", "https://mirror.test"),
-                         ("2583", "http://flibusta.is/"))
-
-    def test_search_single_author(self):
-        search = '<ul><li><a href="/a/2583">Альфонс Доде</a></li></ul>'.encode()
-        calls = []
-
-        def fake_get(url):
-            calls.append(url)
-            if "booksearch?" in url:
-                return search, {}, url
-            if "/opds/author/2583/" in url:
-                return FEED_0.replace(b"/opds/author/1/alphabet/1", b""), {}, url
-            return archive(), {}, url
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            config = Path(folder) / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(flibusta.main(["-a", "альфонс доде", "--config", str(config)]), 0)
-            self.assertTrue((Path(folder) / "Russian Book [10].fb2.zip").exists())
-            self.assertTrue(any("/opds/author/2583/" in call for call in calls))
-
-    def test_search_multiple_authors_prints_every_url_and_stops(self):
-        pages = {
-            "page=0": '<ul><li><a href="/a/2583">Альфонс Доде</a></li></ul><a href="/booksearch?ask=x&amp;page=1&amp;cha=on">2</a>',
-            "page=1": '<ul><li><a href="/a/99">Жан Доде</a></li></ul>',
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.output = Path(self.folder.name)
+        self.config = self.output / 'flibusta.ini'
+        self.config.write_text('[defaults]\nlanguages = ru\nformats = fb2\n'
+                               '[site]\nmirror = http://127.0.0.1\n'
+                               '[downloads]\nworkers = 2\nextract_zip = no\n')
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), FixtureHandler)
+        self.addCleanup(self.server.server_close)
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.base = f'http://127.0.0.1:{self.server.server_address[1]}'
+        self.config.write_text(self.config.read_text().replace('http://127.0.0.1\n', self.base + '\n'))
+        FixtureHandler.calls = []
+        FixtureHandler.responses = {
+            '/opds/author/1/alphabet/0': (200, FEED, 'application/atom+xml'),
+            '/b/10/fb2': (200, fb2_zip(), 'application/fb2+zip'),
+            '/b/10/pdf': (200, b'%PDF-1.4\nbook', 'application/pdf'),
+            '/b/11/pdf': (200, b'%PDF-1.4\nbook', 'application/pdf'),
         }
-        calls = []
+        self.cwd_patch = patch.object(cli.Path, 'cwd', return_value=self.output)
+        self.cwd_patch.start()
+        self.addCleanup(self.cwd_patch.stop)
 
-        def fake_get(url):
-            calls.append(url)
-            return pages["page=1" if "page=1" in url else "page=0"].encode(), {}, url
+    def run_cli(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = cli.main([*args, '--config', str(self.config)])
+        return code, stdout.getvalue(), stderr.getvalue()
 
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get):
-            config = Path(folder) / "config.ini"
-            config.write_text("[site]\nmirror = https://mirror.test\n")
-            out, err = io.StringIO(), io.StringIO()
-            with redirect_stdout(out), redirect_stderr(err):
-                self.assertEqual(flibusta.main(["-a", "доде", "--config", str(config)]), 1)
-            self.assertEqual(out.getvalue().splitlines(), [
-                "Альфонс Доде: https://mirror.test/a/2583",
-                "Жан Доде: https://mirror.test/a/99",
-            ])
-            self.assertNotIn("Ошибка:", err.getvalue())
-            self.assertEqual(len(calls), 2)
+    def test_downloads_requested_formats_and_records_sqlite_journal(self):
+        code, stdout, stderr = self.run_cli('1', '-f', 'fb2', 'pdf')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(set(stdout.splitlines()), {'Russian Book [10].fb2.zip',
+                                                  'Russian Book [10].pdf'})
+        self.assertTrue((self.output / 'Russian Book [10].fb2.zip').exists())
+        with sqlite3.connect(self.output / LOG_NAME) as connection:
+            rows = connection.execute('SELECT status, format FROM downloads').fetchall()
+        self.assertEqual(set(rows), {('downloaded', 'fb2'), ('downloaded', 'pdf')})
 
-    def test_retry_uses_log_without_refetching_catalog(self):
-        feed = FEED_0.replace(b"/opds/author/1/alphabet/1", b"")
-        attempts = []
+    def test_language_filter_and_ini_multiple_formats(self):
+        self.config.write_text(self.config.read_text().replace('formats = fb2',
+                                                               'formats = fb2 pdf'))
+        code, stdout, stderr = self.run_cli('1', '-l', 'en')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.splitlines(), ['English Book [11].pdf'])
 
-        def fake_get(url):
-            attempts.append(url)
-            if "/opds/" in url:
-                return feed, {}, url
-            if len([item for item in attempts if "/b/10/fb2" in item]) == 1:
-                raise TimeoutError("timed out")
-            return archive(), {}, url
+    def test_extract_zip_and_sync_recognizes_nested_file(self):
+        (self.output / 'nested').mkdir()
+        (self.output / 'nested' / 'Russian Book [10].fb2').write_text('already here')
+        code, stdout, stderr = self.run_cli('-s', '1')
+        self.assertEqual((code, stdout), (0, ''))
+        self.assertNotIn('/b/10/fb2', FixtureHandler.calls)
+        code, stdout, stderr = self.run_cli('1', '-x')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual((self.output / 'Russian Book [10].fb2').read_bytes(),
+                         b'<FictionBook><body/></FictionBook>')
 
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            config = Path(folder) / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["1", "--config", str(config), "-x"]), 1)
-            log_path = Path(folder) / flibusta.LOG_NAME
-            entry = next(iter(json.loads(log_path.read_text())["entries"].values()))
-            self.assertEqual((entry["status"], entry["language"], entry["format"], entry["attempts"]),
-                             ("failed", "ru", "fb2", 1))
-            before = len([url for url in attempts if "/opds/" in url])
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(flibusta.main(["-r"]), 0)
-            self.assertEqual(len([url for url in attempts if "/opds/" in url]), before)
-            self.assertEqual((Path(folder) / "Russian Book [10].fb2").read_text(), "book text")
-            entry = next(iter(json.loads(log_path.read_text())["entries"].values()))
-            self.assertEqual((entry["status"], entry["attempts"]), ("downloaded", 2))
-            count = len(attempts)
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(flibusta.main(["-r"]), 0)
-            self.assertEqual(len(attempts), count)
+    def test_search_synonym_resolves_primary_author(self):
+        FixtureHandler.responses['/booksearch?ask=John+Saul&page=0&cha=on'] = (200, SEARCH, 'text/html')
+        FixtureHandler.responses['/opds/author/20391/alphabet/0'] = (200, FEED, 'application/atom+xml')
+        code, _, stderr = self.run_cli('-a', 'John Saul')
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('/opds/author/20391/alphabet/0', FixtureHandler.calls)
+        self.assertNotIn('/opds/author/38360/alphabet/0', FixtureHandler.calls)
 
-    def test_sync_requires_author(self):
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            flibusta.main(["-s"])
+    def test_ambiguous_search_prints_authors_without_creating_journal(self):
+        page = '''<h3>Найденные писатели (1 - 2 из 2):</h3><ul>
+          <li><a href="/a/2583">Альфонс Доде</a></li>
+          <li><a href="/a/99">Жан Доде</a></li></ul>'''.encode()
+        FixtureHandler.responses['/booksearch?ask=%D0%B4%D0%BE%D0%B4%D0%B5&page=0&cha=on'] = (
+            200, page, 'text/html')
+        code, stdout, _ = self.run_cli('-a', 'доде')
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout.splitlines(), [f'Альфонс Доде: {self.base}/a/2583',
+                                               f'Жан Доде: {self.base}/a/99'])
+        self.assertFalse((self.output / LOG_NAME).exists())
 
-    def test_author_search_falls_back_to_opds_after_503(self):
-        author_feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
-          <entry><title>Франсуа Рабле</title><link href="/opds/author/2583" /></entry>
-        </feed>'''.encode()
-        calls = []
+    def test_retry_failed_download_from_sqlite(self):
+        FixtureHandler.responses['/b/10/fb2'] = [(200, b'upstream error', 'text/plain'),
+                                                  (200, fb2_zip(), 'application/fb2+zip')]
+        code, _, _ = self.run_cli('1')
+        self.assertEqual(code, 1)
+        with sqlite3.connect(self.output / LOG_NAME) as connection:
+            self.assertEqual(connection.execute('SELECT status FROM downloads').fetchone()[0], 'failed')
+        before = FixtureHandler.calls.count('/opds/author/1/alphabet/0')
+        code, stdout, stderr = self.run_cli('-r')
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('Russian Book [10].fb2.zip', stdout)
+        self.assertEqual(FixtureHandler.calls.count('/opds/author/1/alphabet/0'), before)
 
-        def fake_get(url):
-            calls.append(url)
-            if "booksearch" in url:
-                raise HTTPError(url, 503, "Backend fetch failed", {}, None)
-            if url.startswith("https://flibusta.is/"):
-                raise HTTPError(url, 503, "Backend fetch failed", {}, None)
-            return author_feed, {}, url
+    def test_retry_x_extracts_zip(self):
+        FixtureHandler.responses['/b/10/fb2'] = [(200, b'bad data', 'text/plain'),
+                                                  (200, fb2_zip(), 'application/fb2+zip')]
+        self.assertEqual(self.run_cli('1')[0], 1)
+        code, stdout, stderr = self.run_cli('-r', '-x')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.splitlines(), ['Russian Book [10].fb2'])
+        self.assertTrue((self.output / 'Russian Book [10].fb2').exists())
 
-        with patch.object(flibusta, "get", fake_get):
-            self.assertEqual(flibusta.author_id_and_base("франсуа рабле", "https://flibusta.is"),
-                             ("2583", "https://flub.flibusta.is/"))
-        self.assertEqual(len(calls), 3)
+    def test_http_503_is_retried(self):
+        FixtureHandler.responses['/b/10/fb2'] = [(503, b'unavailable', 'text/plain'),
+                                                  (200, fb2_zip(), 'application/fb2+zip')]
+        code, stdout, stderr = self.run_cli('1')
+        self.assertEqual(code, 0, stderr)
+        self.assertIn('Russian Book [10].fb2.zip', stdout)
+        self.assertEqual(FixtureHandler.calls.count('/b/10/fb2'), 2)
 
-    def test_exact_author_wins_over_unrelated_page_links(self):
-        page = '''<div id="main"><ul>
-          <li><a href="/a/10084">Франсуа Рабле</a></li>
-          <li><a href="/a/57216">Журавлев</a></li>
-          <li><a href="/a/133220">Уленгов</a></li>
-        </ul></div>'''.encode()
+    def test_bad_pdf_response_is_not_published(self):
+        FixtureHandler.responses['/b/10/pdf'] = (200, b'backend failure', 'text/plain')
+        code, _, _ = self.run_cli('1', '-f', 'pdf')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.output / 'Russian Book [10].pdf').exists())
 
-        with patch.object(flibusta, "get", return_value=(page, {}, "https://flibusta.is/booksearch")):
-            self.assertEqual(flibusta.author_id_and_base("франсуа рабле", "https://flibusta.is"),
-                             ("10084", "https://flibusta.is/"))
+    def test_download_size_limit_leaves_no_partial_file(self):
+        FixtureHandler.responses['/b/10/pdf'] = (200, b'%PDF-' + b'x' * 200_000, 'application/pdf')
+        with patch.object(files, 'BOOK_LIMIT', 100_000):
+            code, _, _ = self.run_cli('1', '-f', 'pdf')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.output / 'Russian Book [10].pdf').exists())
+        self.assertFalse(list(self.output.glob('.flibusta-book-*.tmp')))
 
-    def test_search_by_synonym_uses_primary_author_url(self):
-        page = '''<h3>Найденные писатели (1 - 1 из 1):</h3><ul>
-          <li><a href="/a/20391">Джон Соул</a> (через синоним
-          <a href="/a/38360"><span>John</span> <span>Saul</span></a>) (5 книг)</li>
-        </ul>'''.encode()
+    def test_oversized_zip_member_is_rejected(self):
+        content = b'<FictionBook>' + b'x' * 100 + b'</FictionBook>'
+        FixtureHandler.responses['/b/10/fb2'] = (200, fb2_zip(content), 'application/fb2+zip')
+        with patch.object(files, 'EXTRACT_LIMIT', 50):
+            code, _, _ = self.run_cli('1', '-x')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.output / 'Russian Book [10].fb2').exists())
 
-        with patch.object(flibusta, "get", return_value=(page, {}, "https://flibusta.is/booksearch")):
-            self.assertEqual(flibusta.author_id_and_base("John Saul", "https://flibusta.is"),
-                             ("20391", "https://flibusta.is/"))
-            self.assertEqual(flibusta.author_id_and_base("Джон Соул", "https://flibusta.is"),
-                             ("20391", "https://flibusta.is/"))
+    def test_corrupt_sqlite_is_ignored_only_for_sync(self):
+        (self.output / LOG_NAME).write_text('not a database')
+        code, stdout, _ = self.run_cli('-s', '1')
+        self.assertEqual(code, 0)
+        self.assertIn('Russian Book [10].fb2.zip', stdout)
+        self.assertEqual((self.output / LOG_NAME).read_text(), 'not a database')
+        code, _, _ = self.run_cli('-r')
+        self.assertEqual(code, 1)
 
-    def test_get_retries_503(self):
-        calls = []
+    def test_cancel_during_stream_keeps_pending_job(self):
+        with Journal(self.output / LOG_NAME) as journal:
+            job = {'url': self.base + '/b/10/fb2', 'format': 'fb2', 'book_id': '10',
+                   'title': 'Russian Book', 'language': 'ru', 'mime': 'application/fb2+zip',
+                   'extract_zip': 0}
+            journal.upsert(job)
+            journal.mark_pending(job)
+            self.assertEqual(journal.retry_jobs()[0]['status'], 'pending')
 
-        class Response:
-            headers = {}
-            url = "https://example.test/booksearch"
+    def test_ctrl_c_records_completed_job_and_leaves_other_pending(self):
+        jobs = [{'url': self.base + f'/b/{ident}/pdf', 'format': 'pdf', 'book_id': str(ident),
+                 'title': f'Book {ident}', 'language': 'ru', 'mime': 'application/pdf',
+                 'extract_zip': 0} for ident in (1, 2)]
+        with Journal(self.output / LOG_NAME) as journal:
+            for job in jobs:
+                journal.upsert(job)
+            finished = threading.Event()
 
-            def __init__(self):
-                self.done = False
+            def fake_download(job, output, transport, extract):
+                if job['book_id'] == '1':
+                    finished.set()
+                    return True, output / 'Book 1 [1].pdf'
+                finished.wait(2)
+                transport.cancel.wait(2)
+                from fli_app.transport import DownloadCancelled
+                raise DownloadCancelled()
 
-            def __enter__(self):
-                return self
+            def interrupt(futures):
+                finished.wait(2)
+                raise KeyboardInterrupt()
 
-            def __exit__(self, *_):
-                return False
+            transport = Transport(threading.Event())
+            with patch.object(cli, 'as_completed', interrupt), patch.object(cli, 'download_book', fake_download):
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(KeyboardInterrupt):
+                        cli.run_downloads(jobs, journal, self.output, 2, transport, 'Test')
+            statuses = dict(journal.connection.execute('SELECT book_id, status FROM downloads').fetchall())
+            self.assertEqual(statuses, {'1': 'downloaded', '2': 'pending'})
 
-            def read(self, size):
-                if self.done:
-                    return b""
-                self.done = True
-                return b"ok"
-
-        def fake_open(request, timeout):
-            calls.append(request.full_url)
-            if len(calls) < 3:
-                raise HTTPError(request.full_url, 503, "Backend fetch failed", {}, None)
-            return Response()
-
-        with patch.object(flibusta, "urlopen", fake_open), patch.object(flibusta._cancel_requested, "wait", return_value=False):
-            self.assertEqual(flibusta.get("https://example.test/booksearch")[0], b"ok")
-        self.assertEqual(len(calls), 3)
-
-    def test_ctrl_c_stops_downloads_without_traceback_and_keeps_pending_log(self):
-        self.addCleanup(flibusta._cancel_requested.clear)
-        feed = FEED_0.replace(b"/opds/author/1/alphabet/1", b"")
-
-        def fake_get(url):
-            if "/opds/" in url:
-                return feed, {}, url
-            flibusta._cancel_requested.wait(timeout=2)
-            raise flibusta.DownloadCancelled()
-
-        def interrupt_futures(_):
-            raise KeyboardInterrupt()
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta, "as_completed", interrupt_futures), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            config = Path(folder) / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            output = io.StringIO()
-            with redirect_stderr(output), redirect_stdout(io.StringIO()):
-                self.assertEqual(flibusta.main(["1", "--config", str(config)]), 130)
-            self.assertIn("Прервано пользователем", output.getvalue())
-            self.assertNotIn("Traceback", output.getvalue())
-            entry = next(iter(json.loads((Path(folder) / flibusta.LOG_NAME).read_text())["entries"].values()))
-            self.assertEqual(entry["status"], "pending")
-
-    def test_spinner_uses_plain_status_inside_mc(self):
-        class Terminal(io.StringIO):
-            def isatty(self):
-                return True
-
-        output = Terminal()
-        with patch.dict(flibusta.os.environ, {"MC_SID": "123"}), redirect_stderr(output):
-            with flibusta.Spinner("Читаю каталог"):
-                pass
-        self.assertEqual(output.getvalue(), "Читаю каталог\n")
-
-    def test_downloads_run_in_parallel_and_stdout_has_only_filenames(self):
-        feed = FEED_0.replace(b"/opds/author/1/alphabet/1", b"")
+    def test_workers_start_separate_books_concurrently(self):
         barrier = threading.Barrier(2)
+        jobs = [{'url': self.base + f'/b/{ident}/pdf', 'format': 'pdf', 'book_id': str(ident),
+                 'title': f'Book {ident}', 'language': 'ru', 'mime': 'application/pdf',
+                 'extract_zip': 0} for ident in (1, 2)]
 
-        def fake_get(url):
-            if "/opds/" in url:
-                return feed, {}, url
+        def fake_download(job, output, transport, extract):
             barrier.wait(timeout=2)
-            return (archive() if url.endswith("/fb2") else b"%PDF-1.4"), {}, url
+            return True, output / f"Book {job['book_id']}.pdf"
 
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            config = Path(folder) / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n[downloads]\nworkers = 2\n")
-            output = io.StringIO()
-            with redirect_stdout(output), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["1", "--config", str(config), "-f", "fb2", "pdf"]), 0)
-            self.assertEqual(set(output.getvalue().splitlines()),
-                             {"Russian Book [10].fb2.zip", "Russian Book [10].pdf"})
-            entries = json.loads((Path(folder) / flibusta.LOG_NAME).read_text())["entries"]
-            self.assertEqual({entry["status"] for entry in entries.values()}, {"downloaded"})
+        transport = Transport(threading.Event())
+        with patch.object(cli, 'download_book', fake_download):
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.run_downloads(jobs, None, self.output, 2, transport, 'Test'), 0)
 
-    def test_sync_uses_nested_files_without_json_log(self):
-        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
-          <entry><id>/b/10</id><title>Уже есть</title><content>Язык: ru</content>
-            <link href="/b/10/fb2" type="application/fb2+zip" /></entry>
-          <entry><id>/b/20</id><title>Без ID</title><content>Язык: ru</content>
-            <link href="/b/20/pdf" type="application/pdf" /></entry>
-          <entry><id>/b/30</id><title>Новая книга</title><content>Язык: ru</content>
-            <link href="/b/30/fb2" type="application/fb2+zip" /></entry>
-        </feed>'''.encode()
-        search = '<a href="/a/2583">Альфонс Доде</a>'.encode()
-        calls = []
+    def test_cancel_before_submit_preserves_all_retry_jobs(self):
+        jobs = [{'url': self.base + f'/b/{ident}/pdf', 'format': 'pdf', 'book_id': str(ident),
+                 'title': f'Book {ident}', 'language': 'ru', 'mime': 'application/pdf',
+                 'extract_zip': 0} for ident in (1, 2)]
+        with Journal(self.output / LOG_NAME) as journal:
+            for job in jobs:
+                journal.upsert(job)
+            transport = Transport(threading.Event())
+            with patch.object(cli.ThreadPoolExecutor, 'submit', side_effect=KeyboardInterrupt):
+                with redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+                    cli.run_downloads(jobs, journal, self.output, 2, transport, 'Test')
+            self.assertEqual(len(journal.retry_jobs()), 2)
 
-        def fake_get(url):
-            calls.append(url)
-            if "booksearch?" in url:
-                return search, {}, url
-            if "/opds/author/" in url:
-                return feed, {}, url
-            return archive(), {}, url
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            root = Path(folder)
-            (root / "sub" / "deeper").mkdir(parents=True)
-            (root / "sub" / "Уже есть [10].fb2").write_text("book")
-            (root / "sub" / "deeper" / "Без ID.pdf").write_bytes(b"%PDF-1.4")
-            (root / flibusta.LOG_NAME).write_text("broken json")
-            config = root / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2 pdf\n[site]\nmirror = https://mirror.test\n")
-            output = io.StringIO()
-            with redirect_stdout(output), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["-s", "-a", "альфонс доде", "--config", str(config)]), 0)
-            self.assertEqual(output.getvalue().splitlines(), ["Новая книга [30].fb2.zip"])
-            self.assertEqual([url for url in calls if "/b/" in url], ["https://mirror.test/b/30/fb2"])
-            self.assertEqual((root / flibusta.LOG_NAME).read_text(), "broken json")
-
-    def test_sync_recognizes_archives_and_avoids_ambiguous_titles(self):
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            (root / "nested").mkdir()
-            (root / "nested" / "Archive [11].pdf.rar").write_bytes(b"rar")
-            (root / "nested" / "Archive [12].fb2.zip").write_bytes(b"zip")
-            (root / "Duplicate.fb2").write_text("book")
-            entries = [
-                {"book_id": "11", "title": "Archive", "format": "pdf"},
-                {"book_id": "12", "title": "Archive", "format": "fb2"},
-                {"book_id": "13", "title": "Duplicate", "format": "fb2"},
-                {"book_id": "14", "title": "Duplicate", "format": "fb2"},
-            ]
-            self.assertEqual([entry["book_id"] for entry in flibusta.missing_entries(entries, root)],
-                             ["13", "14"])
-
-    def test_sync_and_retry_are_exclusive(self):
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            flibusta.main(["-s", "-r", "-a", "альфонс доде"])
-
-    def test_sync_records_failure_for_retry_without_using_log_to_decide_missing(self):
-        feed = FEED_0.replace(b"/opds/author/1/alphabet/1", b"")
-        calls = []
-
-        def fake_get(url):
-            calls.append(url)
-            if "/opds/" in url:
-                return feed, {}, url
-            if len([item for item in calls if "/b/10/fb2" in item]) == 1:
-                raise TimeoutError("timed out")
-            return archive(), {}, url
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            root = Path(folder)
-            config = root / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["-s", "1", "--config", str(config)]), 1)
-            log_path = root / flibusta.LOG_NAME
-            entry = next(iter(json.loads(log_path.read_text())["entries"].values()))
-            self.assertEqual(entry["status"], "failed")
-            before = len([url for url in calls if "/opds/" in url])
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["-r", "--config", str(config)]), 0)
-            self.assertEqual(len([url for url in calls if "/opds/" in url]), before)
-            self.assertTrue((root / "Russian Book [10].fb2.zip").exists())
-
-    def test_sync_clears_stale_failure_when_book_is_in_subfolder(self):
-        feed = FEED_0.replace(b"/opds/author/1/alphabet/1", b"")
-        calls = []
-
-        def fake_get(url):
-            calls.append(url)
-            if "/opds/" in url:
-                return feed, {}, url
-            raise AssertionError("existing book was downloaded")
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(flibusta, "get", fake_get), patch.object(flibusta.Path, "cwd", return_value=Path(folder)):
-            root = Path(folder)
-            (root / "nested").mkdir()
-            (root / "nested" / "Russian Book [10].fb2").write_text("book")
-            config = root / "config.ini"
-            config.write_text("[defaults]\nlanguages = ru\nformats = fb2\n[site]\nmirror = https://mirror.test\n")
-            log_path = root / flibusta.LOG_NAME
-            log_path.write_text(json.dumps({"version": 1, "entries": {
-                "https://mirror.test/b/10/fb2|fb2": {
-                    "book_id": "10", "title": "Russian Book", "language": "ru",
-                    "format": "fb2", "url": "https://mirror.test/b/10/fb2",
-                    "mime": "application/fb2+zip", "status": "failed", "error": "timed out",
-                }
-            }}))
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                self.assertEqual(flibusta.main(["-s", "1", "--config", str(config)]), 0)
-                self.assertEqual(flibusta.main(["-r", "--config", str(config)]), 0)
-            entry = next(iter(json.loads(log_path.read_text())["entries"].values()))
-            self.assertEqual(entry["status"], "existing")
-            self.assertEqual(entry["error"], None)
-            self.assertEqual(len([url for url in calls if "/b/" in url]), 0)
+    def test_catalog_and_inventory(self):
+        books, next_url = catalog.parse_feed(FEED)
+        self.assertEqual((len(books), next_url), (2, None))
+        (self.output / 'sub').mkdir()
+        (self.output / 'sub' / 'Russian Book [10].fb2.zip').write_bytes(b'x')
+        jobs = [{'book_id': '10', 'title': 'Russian Book', 'format': 'fb2'},
+                {'book_id': '11', 'title': 'English Book', 'format': 'pdf'}]
+        self.assertEqual([job['book_id'] for job in files.missing_entries(jobs, self.output)], ['11'])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

@@ -8,4 +8,6 @@ __pycache__/
 *.rar
 *.zip
 flibusta-downloads.json
+flibusta-downloads.sqlite3
+flibusta-downloads.sqlite3-*
 .flibusta-*.tmp

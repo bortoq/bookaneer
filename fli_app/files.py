@@ -8,11 +8,13 @@ import tempfile
 import unicodedata
 import zipfile
 
-from .catalog import FORMATS
 from .transport import DownloadCancelled
 
 BOOK_LIMIT = 512 * 1024 * 1024
 EXTRACT_LIMIT = 1024 * 1024 * 1024
+ZIP_DOCUMENT_FORMATS = {"epub", "docx", "odt", "fb3", "cbz", "zip"}
+ZIP_MEMBER_EXTENSIONS = {"djvu": {"djvu", "djv"}, "html": {"html", "htm"},
+                         "jpg": {"jpg", "jpeg"}}
 
 def safe_name(title):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")
@@ -24,25 +26,25 @@ def normalized_title(title):
     return " ".join(re.findall(r"\w+", text.replace("_", " ")))
 
 
-def file_inventory(root):
+def file_inventory(root, formats):
     """Index book files in root and all its subdirectories by ID or title."""
     by_id = set()
     by_title = set()
+    suffixes = sorted(((suffix, fmt) for fmt in formats
+                       for suffix in (f".{fmt}.zip", f".{fmt}.rar", f".{fmt}")),
+                      key=lambda item: len(item[0]), reverse=True)
     for directory, subdirs, filenames in os.walk(root):
         subdirs[:] = [name for name in subdirs if name != ".git"]
         for filename in filenames:
             path = Path(directory) / filename
             if not path.is_file() or path.stat().st_size == 0:
                 continue
-            name = filename
-            suffix = Path(name).suffix.lower()
-            if suffix in (".zip", ".rar"):
-                name = name[:-len(suffix)]
-                suffix = Path(name).suffix.lower()
-            fmt = suffix.lstrip(".")
-            if fmt not in FORMATS:
+            match_suffix = next(((suffix, fmt) for suffix, fmt in suffixes
+                                 if filename.casefold().endswith(suffix)), None)
+            if match_suffix is None:
                 continue
-            stem = name[:-len(suffix)]
+            suffix, fmt = match_suffix
+            stem = filename[:-len(suffix)]
             match = re.search(r"\s+\[(\d+)\]$", stem)
             if match:
                 by_id.add((match.group(1), fmt))
@@ -52,7 +54,7 @@ def file_inventory(root):
 
 
 def missing_entries(entries, root):
-    by_id, by_title = file_inventory(root)
+    by_id, by_title = file_inventory(root, {entry["format"] for entry in entries})
     def title_keys(entry):
         return {(normalized_title(name), entry["format"])
                 for name in (entry["title"], safe_name(entry["title"]))}
@@ -70,17 +72,18 @@ def _validate_payload(path, fmt, mime, cancel):
     if not head:
         raise ValueError("пустой ответ сервера")
     lowered = head.lstrip().lower()
-    if lowered.startswith((b"<!doctype html", b"<html", b"<head", b"<body")):
+    if fmt not in {"html", "htm", "mht", "mhtm"} and lowered.startswith(
+            (b"<!doctype html", b"<html", b"<head", b"<body")):
         raise ValueError("сервер вернул HTML вместо книги")
-    if fmt == "epub" and mime in ("application/epub", "application/epub+zip"):
-        if not zipfile.is_zipfile(path):
-            raise ValueError("сервер вернул повреждённый EPUB")
-        return ".epub", None
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
+            extensions = ZIP_MEMBER_EXTENSIONS.get(fmt, {fmt})
             members = [item for item in archive.infolist()
-                       if not item.is_dir() and Path(item.filename).suffix.lower() == "." + fmt]
+                       if not item.is_dir() and any(item.filename.casefold().endswith("." + ext)
+                                                    for ext in extensions)]
             if not members:
+                if fmt in ZIP_DOCUMENT_FORMATS:
+                    return f".{fmt}", None
                 raise ValueError(f"в ZIP нет файла .{fmt}")
             if members[0].file_size > EXTRACT_LIMIT:
                 raise ValueError("книга в ZIP превышает допустимый размер")
@@ -96,8 +99,10 @@ def _validate_payload(path, fmt, mime, cancel):
             return f".{fmt}.zip", members[0]
     if head.startswith(b"PK\x03\x04"):
         raise ValueError("сервер вернул повреждённый ZIP")
+    if fmt in ZIP_DOCUMENT_FORMATS:
+        raise ValueError(f"сервер вернул повреждённый {fmt.upper()}")
     if head.startswith(b"Rar!\x1a\x07"):
-        return f".{fmt}.rar", None
+        return (f".{fmt}" if fmt == "cbr" else f".{fmt}.rar"), None
     if fmt == "pdf" and not head.startswith(b"%PDF-"):
         raise ValueError("сервер вернул данные вместо PDF")
     if fmt == "djvu" and not head.startswith(b"AT&TFORM"):

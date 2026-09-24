@@ -11,14 +11,18 @@ import requests
 from bs4 import BeautifulSoup
 
 ATOM = "{http://www.w3.org/2005/Atom}"
-FORMATS = {"fb2", "djvu", "pdf", "epub", "mobi", "txt", "rtf", "html"}
 MIME_FORMATS = {
     "application/fb2+zip": "fb2", "application/djvu": "djvu",
-    "image/vnd.djvu": "djvu", "application/pdf": "pdf",
+    "application/djvu+zip": "djvu", "image/vnd.djvu": "djvu",
+    "application/pdf": "pdf",
     "application/pdf+zip": "pdf", "application/pdf+rar": "pdf",
     "application/epub+zip": "epub", "application/epub": "epub",
     "application/x-mobipocket-ebook": "mobi", "application/txt+zip": "txt",
     "application/rtf+zip": "rtf", "application/html+zip": "html",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.oasis.opendocument.text": "odt",
+    "image/jpeg": "jpeg", "audio/mpeg": "mp3",
 }
 
 
@@ -34,7 +38,33 @@ class Book:
     title: str
     language: str
     original_format: str
-    downloads: tuple[tuple[str, str], ...]
+    downloads: tuple[tuple[str, str, str], ...]
+
+
+def normalize_format(value):
+    """Accept catalog format labels while keeping them safe as file suffixes."""
+    value = value.strip().casefold()
+    return value if re.fullmatch(r"\w[\w+.-]{0,30}", value) else None
+
+
+def mime_format(mime):
+    if mime in MIME_FORMATS:
+        return MIME_FORMATS[mime]
+    if mime in {"application/octet-stream", "application/binary", "application/x-download"}:
+        return None
+    if mime.startswith("application/"):
+        return normalize_format(mime.removeprefix("application/").removesuffix("+zip"))
+    return None
+
+
+def link_format(href, mime, original):
+    path = urlparse(href).path
+    match = re.search(r"/b/\d+/([^/]+)$", path)
+    if match and match.group(1).lower() == "download":
+        return normalize_format(original) or mime_format(mime)
+    if match:
+        return normalize_format(match.group(1))
+    return mime_format(mime)
 
 
 def find_authors_html(name, base, transport):
@@ -182,14 +212,15 @@ def parse_feed(data):
         downloads = []
         for link in entry.findall(ATOM + "link"):
             href = link.get("href", "")
-            mime = link.get("type", "").lower()
-            if href and (link.get("rel", "").startswith("http://opds-spec.org/acquisition") or
-                         mime in MIME_FORMATS):
-                downloads.append((href, mime))
+            mime = link.get("type", "").split(";", 1)[0].strip().lower()
+            if href and link.get("rel", "").startswith("http://opds-spec.org/acquisition"):
+                fmt = link_format(href, mime, original)
+                if fmt:
+                    downloads.append((href, mime, fmt))
         ident = entry.findtext(ATOM + "id", default="")
         match = re.search(r"/b/(\d+)", ident)
         if not match:
-            for href, _ in downloads:
+            for href, _, _ in downloads:
                 match = re.search(r"/b/(\d+)", href)
                 if match:
                     break

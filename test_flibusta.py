@@ -16,10 +16,11 @@ from fli_app.transport import Transport
 
 FEED = '''<feed xmlns="http://www.w3.org/2005/Atom">
   <entry><id>/b/10</id><title>Russian Book</title><content>Язык: ru</content>
-    <link href="/b/10/fb2" type="application/fb2+zip" />
-    <link href="/b/10/pdf" type="application/pdf" /></entry>
+    <link rel="http://opds-spec.org/image/thumbnail" href="/i/10" type="image/jpeg" />
+    <link rel="http://opds-spec.org/acquisition" href="/b/10/fb2" type="application/fb2+zip" />
+    <link rel="http://opds-spec.org/acquisition" href="/b/10/pdf" type="application/pdf" /></entry>
   <entry><id>/b/11</id><title>English Book</title><content>Язык: en</content>
-    <link href="/b/11/pdf" type="application/pdf" /></entry>
+    <link rel="http://opds-spec.org/acquisition" href="/b/11/pdf" type="application/pdf" /></entry>
 </feed>'''.encode()
 SEARCH = '''<h3>Найденные писатели (1 - 1 из 1):</h3><ul>
   <li><a href="/a/20391">Джон Соул</a> (через синоним
@@ -106,6 +107,80 @@ class DownloaderTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli('1', '-l', 'en')
         self.assertEqual(code, 0, stderr)
         self.assertEqual(stdout.splitlines(), ['English Book [11].pdf'])
+
+    def test_bare_language_and_format_flags_select_all_catalog_variants(self):
+        code, stdout, stderr = self.run_cli('1', '-l', '-f')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(set(stdout.splitlines()), {'Russian Book [10].fb2.zip',
+                                                  'Russian Book [10].pdf',
+                                                  'English Book [11].pdf'})
+
+    def test_additional_catalog_formats_and_languages(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>/b/12</id><title>Document</title>
+            <content>Формат: docx Язык: de</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/12/download"
+                  type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/></entry>
+          <entry><id>/b/13</id><title>Kindle</title>
+            <content>Формат: azw3 Язык: ru~ru-petr1708</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/13/download"
+                  type="application/octet-stream"/></entry>
+          <entry><id>/b/14</id><title>Scans</title>
+            <content>Формат: djvu Язык: uk</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/14/download"
+                  type="application/djvu+zip"/></entry>
+        </feed>'''.encode()
+        FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
+        FixtureHandler.responses['/b/12/download'] = (200, fb2_zip(b'docx content'), 'application/octet-stream')
+        FixtureHandler.responses['/b/13/download'] = (200, b'kindle content', 'application/octet-stream')
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, 'w') as output:
+            output.writestr('book.djv', b'AT&TFORMdjvu')
+        FixtureHandler.responses['/b/14/download'] = (200, archive.getvalue(), 'application/djvu+zip')
+
+        code, stdout, stderr = self.run_cli('1', '-l', '-f')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(set(stdout.splitlines()), {'Document [12].docx',
+                                                  'Kindle [13].azw3',
+                                                  'Scans [14].djvu.zip'})
+        self.assertEqual((self.output / 'Document [12].docx').read_bytes(),
+                         FixtureHandler.responses['/b/12/download'][1])
+        code, stdout, stderr = self.run_cli('1', '-l', 'de', '-f', 'docx')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, '')  # Existing file is not overwritten.
+
+    def test_sync_recognizes_new_formats_and_multi_dot_suffixes(self):
+        (self.output / 'nested').mkdir()
+        (self.output / 'nested' / 'Document [12].docx').write_bytes(b'docx')
+        (self.output / 'nested' / 'Unusual [13].fb.z.zip').write_bytes(b'zip')
+        jobs = [{'book_id': '12', 'title': 'Document', 'format': 'docx'},
+                {'book_id': '13', 'title': 'Unusual', 'format': 'fb.z'}]
+        self.assertEqual(files.missing_entries(jobs, self.output), [])
+
+    def test_original_archive_formats_and_multi_dot_format(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>/b/15</id><title>Comic</title><content>Формат: cbr Язык: en</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/15/download"
+                  type="application/octet-stream" /></entry>
+          <entry><id>/b/16</id><title>Unusual</title><content>Формат: fb.z Язык: en</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/16/download"
+                  type="application/octet-stream" /></entry>
+        </feed>'''.encode()
+        FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
+        FixtureHandler.responses['/b/15/download'] = (200, b'Rar!\x1a\x07data', 'application/octet-stream')
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w') as archive:
+            archive.writestr('book.fb.z', b'book')
+        FixtureHandler.responses['/b/16/download'] = (200, output.getvalue(), 'application/octet-stream')
+        code, stdout, stderr = self.run_cli('1', '-l', '-f')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(set(stdout.splitlines()), {'Comic [15].cbr', 'Unusual [16].fb.z.zip'})
+
+    def test_retry_rejects_bare_filters(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(['-r', '-l'])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(['-r', '-f'])
 
     def test_extract_zip_and_sync_recognizes_nested_file(self):
         (self.output / 'nested').mkdir()

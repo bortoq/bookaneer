@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 
-from .catalog import AmbiguousAuthors, FORMATS, MIME_FORMATS, author_id_and_base, iter_books
+from .catalog import AmbiguousAuthors, author_id_and_base, iter_books, normalize_format
 from .files import download_book, missing_entries
 from .journal import Journal, LOG_NAME
 from .transport import DownloadCancelled, Transport
@@ -111,14 +111,16 @@ def main(argv=None):
     parser.add_argument("-s", "--sync", action="store_true", help="докачать отсутствующие книги")
     parser.add_argument("-x", "--extract", action="store_true", default=None,
                         help="распаковывать скачанные ZIP")
-    parser.add_argument("-l", "--languages", nargs="+", metavar="LANG", help="языки книг")
-    parser.add_argument("-f", "--formats", nargs="+", metavar="FORMAT", help="форматы книг")
+    parser.add_argument("-l", "--languages", nargs="*", metavar="LANG",
+                        help="языки книг; без значений — все языки")
+    parser.add_argument("-f", "--formats", nargs="*", metavar="FORMAT",
+                        help="форматы книг; без значений — все форматы каталога")
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent.parent / "flibusta.ini")
     args = parser.parse_args(argv)
     if args.retry and args.sync:
         parser.error("-s и -r нельзя использовать вместе")
     if args.retry:
-        if args.author or args.search_author or args.languages or args.formats:
+        if args.author or args.search_author or args.languages is not None or args.formats is not None:
             parser.error("-r запускается отдельно, без автора, -l и -f")
     elif bool(args.author) == bool(args.search_author):
         parser.error("укажите ссылку/ID автора или -a ИМЯ")
@@ -142,29 +144,29 @@ def main(argv=None):
                     journal.upsert(job)
             return run_downloads(jobs, journal, output, workers, transport, "Повторяю загрузку")
 
-        languages = {value.lower() for value in (args.languages or default_languages)}
-        formats = list(dict.fromkeys(value.lower() for value in (args.formats or default_formats)))
-        if not languages or not formats or any(fmt not in FORMATS for fmt in formats):
-            raise ValueError("Укажите языки и форматы; форматы: " + ", ".join(sorted(FORMATS)))
+        language_values = default_languages if args.languages is None else args.languages
+        format_values = default_formats if args.formats is None else args.formats
+        languages = {value.casefold() for value in language_values} if language_values else None
+        formats = list(dict.fromkeys(normalize_format(value) for value in format_values)) if format_values else None
+        if (args.languages is None and not default_languages or
+                args.formats is None and not default_formats or
+                formats is not None and None in formats):
+            raise ValueError("Укажите корректные языки и форматы в flibusta.ini или ключах командной строки")
         with Spinner("Ищу автора" if args.search_author else "Определяю автора"):
             author_id, base = author_id_and_base(args.search_author or args.author, mirror, transport)
         jobs = []
         seen = set()
         with Spinner("Читаю каталог автора"):
             for book in iter_books(base, author_id, transport):
-                if book.language not in languages:
+                if languages is not None and book.language not in languages:
                     continue
-                for fmt in formats:
+                for href, mime, fmt in book.downloads:
+                    if formats is not None and fmt not in formats:
+                        continue
                     key = (book.id, fmt)
                     if key in seen:
                         continue
                     seen.add(key)
-                    candidates = [(href, mime) for href, mime in book.downloads
-                                  if MIME_FORMATS.get(mime) == fmt or
-                                  (href.rstrip("/").endswith("/download") and book.original_format == fmt)]
-                    if not candidates:
-                        continue
-                    href, mime = candidates[0]
                     jobs.append({"book_id": book.id, "title": book.title,
                                  "language": book.language, "format": fmt,
                                  "url": urljoin(base, href), "mime": mime,

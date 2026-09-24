@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt ruff
+          python -m pip install -r requirements.txt ruff==0.15.15
       - name: Lint
         run: ruff check flibusta.py fli_app test_flibusta.py
       - name: Test

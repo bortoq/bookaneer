@@ -1,27 +1,41 @@
-# Загрузчик книг Флибусты
+# Bookaneer — загрузчик книг Флибусты
 
-Программа получает каталог книг автора по OPDS и скачивает выбранные языки и форматы в текущую папку. Нужен Python 3.10 или новее. Установите зависимости: `python3 -m pip install -r requirements.txt`.
+[![CI](https://github.com/bortoq/bookaneer/actions/workflows/ci.yml/badge.svg)](https://github.com/bortoq/bookaneer/actions/workflows/ci.yml)
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
+
+Программа получает каталог книг автора по OPDS и скачивает выбранные языки и форматы в текущую папку. Нужен Python 3.10 или новее.
+
+```bash
+git clone https://github.com/bortoq/bookaneer.git
+cd bookaneer
+python3 -m pip install -r requirements.txt
+# Необязательно: создать короткую команду fli, если ~/bin есть в PATH
+mkdir -p "$HOME/bin"
+ln -s "$PWD/flibusta.py" "$HOME/bin/fli"
+```
+
+Запускайте `flibusta.py` из любой папки, куда хотите сохранить книги. В примерах ниже используется необязательная команда `fli`; без неё замените `fli` на `python3 /путь/к/bookaneer/flibusta.py`.
 
 ## Использование
 
 ```bash
 # Скачать книги по ссылке на автора или его числовому ID
-python3 /home/user/work/flibusta/flibusta.py https://flibusta.is/a/10084
+fli https://flibusta.is/a/10084
 
 # Найти автора по имени
-python3 /home/user/work/flibusta/flibusta.py -a "франсуа рабле"
+fli -a "франсуа рабле"
 
 # Выбрать языки и форматы
-python3 /home/user/work/flibusta/flibusta.py -a "франсуа рабле" -l ru en -f fb2 pdf djvu
+fli -a "франсуа рабле" -l ru en -f fb2 pdf djvu
 
 # Распаковать скачанные ZIP (по умолчанию они сохраняются как архивы)
-python3 /home/user/work/flibusta/flibusta.py -x -a "франсуа рабле"
+fli -x -a "франсуа рабле"
 
 # Из папки с книгами автора: докачать отсутствующие, включая проверку подпапок
-python3 /home/user/work/flibusta/flibusta.py -s -a "франсуа рабле"
+fli -s -a "франсуа рабле"
 
 # Повторить неудачные загрузки из журнала текущей папки
-python3 /home/user/work/flibusta/flibusta.py -r
+fli -r
 ```
 
 Книги и журнал SQLite `flibusta-downloads.sqlite3` сохраняются в **папке, из которой запущена команда**, а не рядом со скриптом. Настройки по умолчанию читаются из `flibusta.ini` рядом со скриптом; другой файл можно указать через `--config ПУТЬ`.

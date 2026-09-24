@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.fb2
+*.pdf
+*.djvu
+*.epub
+*.mobi
+*.rar
+*.zip

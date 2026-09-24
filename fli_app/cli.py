@@ -21,7 +21,7 @@ from .ui import Spinner
 
 def settings(path):
     config = configparser.ConfigParser(interpolation=None)
-    if not config.read(path, encoding="utf-8"):
+    if path is not None and not config.read(path, encoding="utf-8"):
         raise ValueError(f"Не найден файл настроек: {path}")
     workers = config.getint("downloads", "workers", fallback=4)
     if not 1 <= workers <= 16:
@@ -115,7 +115,8 @@ def main(argv=None):
                         help="языки книг; без значений — все языки")
     parser.add_argument("-f", "--formats", nargs="*", metavar="FORMAT",
                         help="форматы книг; без значений — все форматы каталога")
-    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent.parent / "flibusta.ini")
+    source_config = Path(__file__).resolve().parent.parent / "flibusta.ini"
+    parser.add_argument("--config", type=Path, default=source_config if source_config.exists() else None)
     args = parser.parse_args(argv)
     if args.retry and args.sync:
         parser.error("-s и -r нельзя использовать вместе")
@@ -158,7 +159,8 @@ def main(argv=None):
         seen = set()
         with Spinner("Читаю каталог автора"):
             for book in iter_books(base, author_id, transport):
-                if languages is not None and book.language not in languages:
+                if (languages is not None and book.language not in languages
+                        and book.language.split("~", 1)[0] not in languages):
                     continue
                 for href, mime, fmt in book.downloads:
                     if formats is not None and fmt not in formats:

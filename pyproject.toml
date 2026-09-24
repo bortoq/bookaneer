@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bookaneer"
+version = "0.1.0"
+description = "Download an author's books from Flibusta OPDS"
+readme = "readme.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.32,<3",
+    "beautifulsoup4>=4.12,<5",
+]
+
+[project.scripts]
+fli = "fli_app.cli:main"
+
+[tool.setuptools]
+packages = ["fli_app"]

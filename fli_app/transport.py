@@ -2,14 +2,40 @@
 
 import io
 import threading
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 
 USER_AGENT = "flibusta-author-downloader/2.0"
 CHUNK_SIZE = 64 * 1024
 CATALOG_LIMIT = 8 * 1024 * 1024
+MAX_ATTEMPTS = 3
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _retry_delay(error, attempt):
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        if response is None or response.status_code not in TRANSIENT_STATUSES:
+            return None
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                try:
+                    delay = (parsedate_to_datetime(retry_after) -
+                             datetime.now(timezone.utc)).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    delay = None
+            if delay is not None:
+                return min(10, max(0, delay))
+    elif not isinstance(error, (requests.Timeout, requests.ConnectionError,
+                                requests.exceptions.ChunkedEncodingError)) or isinstance(
+                                    error, requests.exceptions.SSLError):
+        return None
+    return attempt + 1
 
 
 class DownloadCancelled(Exception):
@@ -24,20 +50,13 @@ class Transport:
     def _session(self):
         if not hasattr(self.local, "session"):
             session = requests.Session()
-            retry = Retry(total=2, backoff_factor=0.5,
-                          status_forcelist=(429, 500, 502, 503, 504),
-                          allowed_methods=("GET",), respect_retry_after_header=True,
-                          retry_after_max=10)
-            adapter = HTTPAdapter(max_retries=retry)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
             session.headers["User-Agent"] = USER_AGENT
             self.local.session = session
         return self.local.session
 
     def fetch(self, url, output, limit=None):
         """Write a response to a seekable file; restart from zero on read errors."""
-        for attempt in range(3):
+        for attempt in range(MAX_ATTEMPTS):
             if self.cancel.is_set():
                 raise DownloadCancelled()
             output.seek(0)
@@ -54,10 +73,11 @@ class Transport:
                             raise ValueError("ответ сервера превышает допустимый размер")
                         output.write(chunk)
                     return dict(response.headers), response.url
-            except requests.RequestException:
-                if attempt == 2:
+            except requests.RequestException as exc:
+                delay = _retry_delay(exc, attempt)
+                if delay is None or attempt == MAX_ATTEMPTS - 1:
                     raise
-                if self.cancel.wait(attempt + 1):
+                if self.cancel.wait(delay):
                     raise DownloadCancelled()
 
     def get_bytes(self, url):

@@ -35,6 +35,25 @@ def fb2_zip(content=b'<FictionBook><body/></FictionBook>'):
     return output.getvalue()
 
 
+def document_zip(fmt):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as archive:
+        if fmt == 'docx':
+            archive.writestr('[Content_Types].xml',
+                             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+            archive.writestr('_rels/.rels',
+                             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
+            archive.writestr('word/document.xml',
+                             '<document xmlns="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>')
+        elif fmt == 'epub':
+            archive.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
+            archive.writestr('META-INF/container.xml',
+                             '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                             '<rootfiles><rootfile full-path="OPS/book.opf"/></rootfiles></container>')
+            archive.writestr('OPS/book.opf', '<package xmlns="http://www.idpf.org/2007/opf"/>')
+    return output.getvalue()
+
+
 class FixtureHandler(BaseHTTPRequestHandler):
     responses = {}
     calls = []
@@ -131,8 +150,8 @@ class DownloaderTests(unittest.TestCase):
                   type="application/djvu+zip"/></entry>
         </feed>'''.encode()
         FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
-        FixtureHandler.responses['/b/12/download'] = (200, fb2_zip(b'docx content'), 'application/octet-stream')
-        FixtureHandler.responses['/b/13/download'] = (200, b'kindle content', 'application/octet-stream')
+        FixtureHandler.responses['/b/12/download'] = (200, document_zip('docx'), 'application/octet-stream')
+        FixtureHandler.responses['/b/13/download'] = (200, b'\0' * 60 + b'BOOKMOBI' + b'book', 'application/octet-stream')
         archive = io.BytesIO()
         with zipfile.ZipFile(archive, 'w') as output:
             output.writestr('book.djv', b'AT&TFORMdjvu')
@@ -148,6 +167,49 @@ class DownloaderTests(unittest.TestCase):
         code, stdout, stderr = self.run_cli('1', '-l', 'de', '-f', 'docx')
         self.assertEqual(code, 0, stderr)
         self.assertEqual(stdout, '')  # Existing file is not overwritten.
+
+    def test_ru_includes_historical_russian_variant(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>/b/13</id><title>Old Russian</title>
+            <content>Язык: ru~ru-petr1708</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/13/fb2"
+                  type="application/fb2+zip"/></entry>
+        </feed>'''.encode()
+        FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
+        FixtureHandler.responses['/b/13/fb2'] = (200, fb2_zip(), 'application/fb2+zip')
+        self.assertEqual(self.run_cli('1')[1].splitlines(), ['Old Russian [13].fb2.zip'])
+
+    def test_wrong_document_archives_and_plain_text_azw3_are_rejected(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>/b/12</id><title>Document</title><content>Формат: docx Язык: ru</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/12/download" type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/></entry>
+          <entry><id>/b/13</id><title>Kindle</title><content>Формат: azw3 Язык: ru</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/13/download" type="application/octet-stream"/></entry>
+          <entry><id>/b/14</id><title>EPUB</title><content>Формат: epub Язык: ru</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/14/download" type="application/epub+zip"/></entry>
+        </feed>'''.encode()
+        FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
+        FixtureHandler.responses['/b/12/download'] = (200, fb2_zip(), 'application/octet-stream')
+        FixtureHandler.responses['/b/13/download'] = (200, b'kindle content', 'application/octet-stream')
+        FixtureHandler.responses['/b/14/download'] = (200, fb2_zip(), 'application/epub+zip')
+        code, stdout, stderr = self.run_cli('1', '-f')
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, '')
+        self.assertEqual(stderr.count('Ошибка:'), 3)
+        self.assertFalse(list(self.output.glob('*.docx')))
+        self.assertFalse(list(self.output.glob('*.azw3')))
+        self.assertFalse(list(self.output.glob('*.epub')))
+
+    def test_valid_epub_package_is_accepted(self):
+        feed = '''<feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><id>/b/14</id><title>EPUB</title><content>Формат: epub Язык: ru</content>
+            <link rel="http://opds-spec.org/acquisition" href="/b/14/download" type="application/epub+zip"/></entry>
+        </feed>'''.encode()
+        FixtureHandler.responses['/opds/author/1/alphabet/0'] = (200, feed, 'application/atom+xml')
+        FixtureHandler.responses['/b/14/download'] = (200, document_zip('epub'), 'application/epub+zip')
+        code, stdout, stderr = self.run_cli('1', '-f', 'epub')
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.splitlines(), ['EPUB [14].epub'])
 
     def test_sync_recognizes_new_formats_and_multi_dot_suffixes(self):
         (self.output / 'nested').mkdir()
@@ -242,6 +304,15 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertIn('Russian Book [10].fb2.zip', stdout)
         self.assertEqual(FixtureHandler.calls.count('/b/10/fb2'), 2)
+
+    def test_http_retries_are_bounded_and_404_is_permanent(self):
+        FixtureHandler.responses['/b/10/fb2'] = (503, b'unavailable', 'text/plain')
+        self.assertEqual(self.run_cli('1')[0], 1)
+        self.assertEqual(FixtureHandler.calls.count('/b/10/fb2'), 3)
+        FixtureHandler.calls = []
+        FixtureHandler.responses['/b/10/fb2'] = (404, b'missing', 'text/plain')
+        self.assertEqual(self.run_cli('1')[0], 1)
+        self.assertEqual(FixtureHandler.calls.count('/b/10/fb2'), 1)
 
     def test_bad_pdf_response_is_not_published(self):
         FixtureHandler.responses['/b/10/pdf'] = (200, b'backend failure', 'text/plain')

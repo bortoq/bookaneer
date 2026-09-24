@@ -7,6 +7,7 @@ import re
 import tempfile
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ET
 
 from .transport import DownloadCancelled
 
@@ -15,6 +16,59 @@ EXTRACT_LIMIT = 1024 * 1024 * 1024
 ZIP_DOCUMENT_FORMATS = {"epub", "docx", "odt", "fb3", "cbz", "zip"}
 ZIP_MEMBER_EXTENSIONS = {"djvu": {"djvu", "djv"}, "html": {"html", "htm"},
                          "jpg": {"jpg", "jpeg"}}
+ZIP_METADATA_LIMIT = 8 * 1024 * 1024
+
+
+def _zip_part(archive, name):
+    try:
+        info = archive.getinfo(name)
+    except KeyError as exc:
+        raise ValueError(f"в архиве нет обязательного файла {name}") from exc
+    if info.file_size > ZIP_METADATA_LIMIT:
+        raise ValueError(f"слишком большой служебный файл {name}")
+    return archive.read(info)
+
+
+def _zip_xml(archive, name):
+    try:
+        return ET.fromstring(_zip_part(archive, name))
+    except ET.ParseError as exc:
+        raise ValueError(f"повреждён XML-файл {name}") from exc
+
+
+def _validate_document_zip(archive, fmt):
+    if fmt == "docx":
+        types = _zip_xml(archive, "[Content_Types].xml")
+        relationships = _zip_xml(archive, "_rels/.rels")
+        document = _zip_xml(archive, "word/document.xml")
+        if (types.tag != "{http://schemas.openxmlformats.org/package/2006/content-types}Types"
+                or relationships.tag != "{http://schemas.openxmlformats.org/package/2006/relationships}Relationships"
+                or document.tag != "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}document"):
+            raise ValueError("неверная структура DOCX")
+    elif fmt == "epub":
+        if _zip_part(archive, "mimetype") != b"application/epub+zip":
+            raise ValueError("неверный mimetype EPUB")
+        container = _zip_xml(archive, "META-INF/container.xml")
+        rootfiles = container.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile")
+        if not rootfiles:
+            raise ValueError("в EPUB нет файла пакета из container.xml")
+        package = _zip_xml(archive, rootfiles[0].get("full-path") or "")
+        if package.tag != "{http://www.idpf.org/2007/opf}package":
+            raise ValueError("неверный файл пакета EPUB")
+    elif fmt == "odt":
+        if _zip_part(archive, "mimetype") != b"application/vnd.oasis.opendocument.text":
+            raise ValueError("неверный mimetype ODT")
+        _zip_xml(archive, "content.xml")
+        _zip_xml(archive, "META-INF/manifest.xml")
+    elif fmt == "cbz":
+        if not any(item.filename.casefold().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp"))
+                   for item in archive.infolist() if not item.is_dir()):
+            raise ValueError("в CBZ нет изображений")
+    elif fmt == "fb3":
+        _zip_xml(archive, "[Content_Types].xml")
+        _zip_xml(archive, "_rels/.rels")
+        _zip_xml(archive, "fb3/body.xml")
+        _zip_xml(archive, "fb3/description.xml")
 
 def safe_name(title):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" .")
@@ -77,13 +131,14 @@ def _validate_payload(path, fmt, mime, cancel):
         raise ValueError("сервер вернул HTML вместо книги")
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
+            if fmt in ZIP_DOCUMENT_FORMATS:
+                _validate_document_zip(archive, fmt)
+                return f".{fmt}", None
             extensions = ZIP_MEMBER_EXTENSIONS.get(fmt, {fmt})
             members = [item for item in archive.infolist()
                        if not item.is_dir() and any(item.filename.casefold().endswith("." + ext)
                                                     for ext in extensions)]
             if not members:
-                if fmt in ZIP_DOCUMENT_FORMATS:
-                    return f".{fmt}", None
                 raise ValueError(f"в ZIP нет файла .{fmt}")
             if members[0].file_size > EXTRACT_LIMIT:
                 raise ValueError("книга в ZIP превышает допустимый размер")
@@ -111,6 +166,8 @@ def _validate_payload(path, fmt, mime, cancel):
         raise ValueError("сервер вернул данные вместо FB2")
     if fmt == "rtf" and not head.startswith(b"{\\rtf"):
         raise ValueError("сервер вернул данные вместо RTF")
+    if fmt in {"azw3", "mobi"} and head[60:68] != b"BOOKMOBI":
+        raise ValueError(f"сервер вернул данные вместо {fmt.upper()}")
     return f".{fmt}", None
 
 
